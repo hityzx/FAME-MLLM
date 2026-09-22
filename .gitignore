@@ -1,0 +1,33 @@
+# Python caches and virtual environments
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Editors and operating systems
+.vscode/
+.idea/
+.DS_Store
+
+# Training data, caches, outputs, and checkpoints
+data/
+dataset/
+cache/
+outputs/
+checkpoints/
+wandb/
+runs/
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.safetensors
+*.npy
+*.npz
+
+# Logs and generated inference results
+*.log
+*-results.json
+inference_results.json
+
