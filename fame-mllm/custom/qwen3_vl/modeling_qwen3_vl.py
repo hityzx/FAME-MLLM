@@ -48,10 +48,6 @@ from .configuration_qwen3_vl import Qwen3VLConfig, Qwen3VLTextConfig, Qwen3VLVis
 import math
 
 
-# Should be consistent with dataloader.py
-DEFAULT_NUM_DEGRADATION_TYPES = 6
-
-
 def build_dct_matrix(size: int) -> torch.Tensor:
     """
     Build orthonormal DCT-II transform matrix.
@@ -218,15 +214,7 @@ class PropagationAwareFaVA(nn.Module):
 
     Output:
         {
-            "tokens":               [B, V, N, D] or [B, N, D],
-            "type_logits":          [B, V, C] or [B, C],
-            "severity_score":       [B, V] or [B],
-            "fake_logits":          [B, V, 2] or [B, 2],
-            "local_artifact_logits":[B, V, T, Gh, Gw] or [B, T, Gh, Gw],
-            "candidate_score_logits":[B, V, T, L, num_bands] or ...,
-            "selected_indices":     [B, V, top_k] or ...,
-            "low_frequency_penalty": scalar,
-            "mask_diversity_loss":  scalar,
+            "tokens": [B, V, N, D] or [B, N, D],
         }
     """
 
@@ -244,7 +232,6 @@ class PropagationAwareFaVA(nn.Module):
         top_k: int = 1024,
         candidate_hidden_dim: int = 256,
         head_hidden_dim: int = 256,
-        num_degradation_types: int = DEFAULT_NUM_DEGRADATION_TYPES,
         dropout: float = 0.1,
         use_ycbcr: bool = True,
         peak_selection: str = "topk",
@@ -332,28 +319,6 @@ class PropagationAwareFaVA(nn.Module):
 
         self.final_norm = nn.LayerNorm(token_dim)
 
-        # Pretraining heads.
-        self.type_head = MLP(
-            in_dim=token_dim,
-            hidden_dim=head_hidden_dim,
-            out_dim=num_degradation_types,
-            dropout=dropout,
-        )
-
-        self.severity_head = MLP(
-            in_dim=token_dim,
-            hidden_dim=head_hidden_dim,
-            out_dim=1,
-            dropout=dropout,
-        )
-
-        self.fake_head = MLP(
-            in_dim=token_dim,
-            hidden_dim=head_hidden_dim,
-            out_dim=2,
-            dropout=dropout,
-        )
-
     # ------------------------------------------------------------------
     # Main forward
     # ------------------------------------------------------------------
@@ -404,34 +369,14 @@ class PropagationAwareFaVA(nn.Module):
             flat_frames
         )
 
-        selected_candidates, selected_indices = self._select_candidates(
+        selected_candidates, _ = self._select_candidates(
             candidate_tokens=candidate_tokens,
             candidate_score_logits=candidate_score_logits,
         )
 
         tokens = self._query_tokenize(selected_candidates)
 
-        pooled = tokens.mean(dim=1)
-
-        type_logits = self.type_head(pooled)
-        severity_score = self.severity_head(pooled).squeeze(-1)
-        fake_logits = self.fake_head(pooled)
-
-        local_artifact_logits = self._candidate_scores_to_patch_logits(
-            candidate_score_logits=candidate_score_logits,
-        )
-
-        outputs: Dict[str, torch.Tensor] = {
-            "tokens": tokens,
-            "type_logits": type_logits,
-            "severity_score": severity_score,
-            "fake_logits": fake_logits,
-            "local_artifact_logits": local_artifact_logits,
-            "candidate_score_logits": candidate_score_logits,
-            "selected_indices": selected_indices,
-            "low_frequency_penalty": self.low_frequency_penalty(),
-            "mask_diversity_loss": self.frequency_mask_diversity_loss(),
-        }
+        outputs: Dict[str, torch.Tensor] = {"tokens": tokens}
 
         if restore_shape is not None:
             bsz, num_variants = restore_shape
@@ -704,103 +649,6 @@ class PropagationAwareFaVA(nn.Module):
         tokens = self.final_norm(queries)
         return tokens
 
-    def _candidate_scores_to_patch_logits(
-        self,
-        candidate_score_logits: torch.Tensor,
-    ) -> torch.Tensor:
-        """
-        Convert candidate-level artifactness logits to patch-level logits.
-
-        Args:
-            candidate_score_logits: [B, T*L*num_bands]
-
-        Returns:
-            patch_logits: [B, T, Gh, Gw]
-        """
-        bsz = candidate_score_logits.shape[0]
-
-        scores = candidate_score_logits.reshape(
-            bsz,
-            self.num_frames,
-            self.num_patches,
-            self.num_bands,
-        )
-
-        # Max over frequency bands.
-        patch_logits = scores.max(dim=-1).values
-        patch_logits = patch_logits.reshape(
-            bsz,
-            self.num_frames,
-            self.grid_h,
-            self.grid_w,
-        )
-
-        return patch_logits
-
-    # ------------------------------------------------------------------
-    # Utility losses for masks / token diversity
-    # ------------------------------------------------------------------
-
-    def low_frequency_penalty(self) -> torch.Tensor:
-        """
-        Penalize excessive attention to very low-frequency coefficients.
-        """
-        masks = torch.sigmoid(self.raw_frequency_masks)
-        masks = masks.reshape(self.num_bands, -1)
-
-        low_region = self.low_region.to(device=masks.device, dtype=masks.dtype)
-
-        penalty = (masks * low_region).sum(dim=-1) / low_region.sum().clamp_min(1.0)
-        return penalty.mean()
-
-    def frequency_mask_diversity_loss(self) -> torch.Tensor:
-        """
-        Encourage different frequency masks to cover complementary regions.
-        """
-        masks = torch.sigmoid(self.raw_frequency_masks)
-        masks = masks.reshape(self.num_bands, -1)
-
-        masks = F.normalize(masks, dim=-1)
-        sim = masks @ masks.t()
-
-        eye = torch.eye(
-            self.num_bands,
-            device=masks.device,
-            dtype=masks.dtype,
-        )
-
-        off_diag = sim - eye
-        return off_diag.pow(2).sum() / max(1, self.num_bands * (self.num_bands - 1))
-
-    @staticmethod
-    def token_diversity_loss(tokens: torch.Tensor) -> torch.Tensor:
-        """
-        Encourage artifact query tokens to be non-collapsed.
-
-        Args:
-            tokens: [B, V, N, D] or [B, N, D]
-        """
-        if tokens.dim() == 4:
-            bsz, num_variants, n_tokens, dim = tokens.shape
-            tokens = tokens.reshape(bsz * num_variants, n_tokens, dim)
-        elif tokens.dim() == 3:
-            pass
-        else:
-            raise ValueError("tokens must be [B, V, N, D] or [B, N, D].")
-
-        tokens = F.normalize(tokens, dim=-1)
-        sim = tokens @ tokens.transpose(1, 2)
-
-        n_tokens = sim.shape[-1]
-        eye = torch.eye(
-            n_tokens,
-            device=tokens.device,
-            dtype=tokens.dtype,
-        ).unsqueeze(0)
-
-        loss = (sim - eye).pow(2).mean()
-        return loss
-
     # ------------------------------------------------------------------
     # Shape and color helpers
     # ------------------------------------------------------------------
@@ -848,268 +696,6 @@ class PropagationAwareFaVA(nn.Module):
                 restored[key] = value
 
         return restored
-
-
-def compute_fava_pretrain_losses(
-    outputs: Dict[str, torch.Tensor],
-    batch: Dict[str, torch.Tensor],
-    type_weight: float = 1.0,
-    rank_weight: float = 0.3,
-    loc_weight: float = 0.5,
-    fake_weight: float = 0.0,
-    low_weight: float = 0.05,
-    mask_div_weight: float = 0.0,
-    token_div_weight: float = 0.0,
-    rank_margin: float = 0.2,
-) -> Dict[str, torch.Tensor]:
-    """
-    Compute pretraining losses for Propagation-Aware FaVA.
-
-    Expected batch fields from dataloader.py:
-        type_labels:     [B, V, C]
-        severity:        [B, V]
-        local_masks:     [B, V, T, Gh, Gw]
-        has_local_mask:  [B, V]
-        fake_label:      [B]
-
-    Expected output fields:
-        type_logits:             [B, V, C]
-        severity_score:          [B, V]
-        local_artifact_logits:   [B, V, T, Gh, Gw]
-        fake_logits:             [B, V, 2]
-    """
-    device = outputs["type_logits"].device
-
-    type_labels = batch["type_labels"].to(device=device, dtype=torch.float32)
-    severity_labels = batch["severity"].to(device=device, dtype=torch.float32)
-
-    type_logits = outputs["type_logits"]
-    severity_score = outputs["severity_score"]
-
-    type_loss = F.binary_cross_entropy_with_logits(
-        type_logits,
-        type_labels,
-    )
-
-    rank_loss = pairwise_ranking_loss(
-        scores=severity_score,
-        labels=severity_labels,
-        margin=rank_margin,
-    )
-
-    local_loss = compute_local_artifact_loss(outputs, batch)
-
-    fake_loss = torch.zeros((), device=device)
-    if fake_weight > 0.0:
-        fake_logits = outputs["fake_logits"]
-        fake_label = batch["fake_label"].to(device=device, dtype=torch.long)
-
-        if fake_logits.dim() == 3:
-            # [B, V, 2]
-            bsz, num_variants, _ = fake_logits.shape
-            fake_target = fake_label[:, None].expand(bsz, num_variants)
-            fake_loss = F.cross_entropy(
-                fake_logits.reshape(bsz * num_variants, 2),
-                fake_target.reshape(-1),
-            )
-        else:
-            fake_loss = F.cross_entropy(fake_logits, fake_label)
-
-    low_loss = outputs.get(
-        "low_frequency_penalty",
-        torch.zeros((), device=device),
-    )
-
-    mask_div_loss = outputs.get(
-        "mask_diversity_loss",
-        torch.zeros((), device=device),
-    )
-
-    token_div_loss = torch.zeros((), device=device)
-    if token_div_weight > 0.0:
-        token_div_loss = PropagationAwareFaVA.token_diversity_loss(
-            outputs["tokens"]
-        )
-
-    total = (
-        type_weight * type_loss
-        + rank_weight * rank_loss
-        + loc_weight * local_loss
-        + fake_weight * fake_loss
-        + low_weight * low_loss
-        + mask_div_weight * mask_div_loss
-        + token_div_weight * token_div_loss
-    )
-
-    return {
-        "loss": total,
-        "type_loss": type_loss.detach(),
-        "rank_loss": rank_loss.detach(),
-        "local_loss": local_loss.detach(),
-        "fake_loss": fake_loss.detach(),
-        "low_loss": low_loss.detach(),
-        "mask_div_loss": mask_div_loss.detach(),
-        "token_div_loss": token_div_loss.detach(),
-    }
-
-
-def pairwise_ranking_loss(
-    scores: torch.Tensor,
-    labels: torch.Tensor,
-    margin: float = 0.2,
-) -> torch.Tensor:
-    """
-    Pairwise ranking loss.
-
-    Args:
-        scores: [B, V]
-        labels: [B, V], larger means heavier degradation.
-
-    For each pair i, j:
-        if label_j > label_i, require score_j > score_i + margin.
-    """
-    if scores.dim() != 2 or labels.dim() != 2:
-        raise ValueError("scores and labels should both be [B, V].")
-
-    device = scores.device
-
-    labels_i = labels.unsqueeze(2)  # [B, V, 1]
-    labels_j = labels.unsqueeze(1)  # [B, 1, V]
-
-    scores_i = scores.unsqueeze(2)
-    scores_j = scores.unsqueeze(1)
-
-    pair_mask = labels_j > labels_i
-    score_diff = scores_j - scores_i
-
-    if pair_mask.sum() == 0:
-        return torch.zeros((), device=device)
-
-    losses = F.relu(margin - score_diff)
-    return losses[pair_mask].mean()
-
-
-def compute_local_artifact_loss(
-    outputs: Dict[str, torch.Tensor],
-    batch: Dict[str, torch.Tensor],
-) -> torch.Tensor:
-    """
-    BCE loss for patch-level local artifactness.
-
-    Only variants with has_local_mask=True are used.
-    """
-    device = outputs["local_artifact_logits"].device
-
-    local_logits = outputs["local_artifact_logits"]
-    local_masks = batch["local_masks"].to(device=device, dtype=torch.float32)
-    has_local_mask = batch["has_local_mask"].to(device=device, dtype=torch.bool)
-
-    if has_local_mask.sum() == 0:
-        return torch.zeros((), device=device)
-
-    selected_logits = local_logits[has_local_mask]
-    selected_masks = local_masks[has_local_mask]
-
-    return F.binary_cross_entropy_with_logits(
-        selected_logits,
-        selected_masks,
-    )
-
-
-@torch.no_grad()
-def compute_pretrain_metrics(
-    outputs: Dict[str, torch.Tensor],
-    batch: Dict[str, torch.Tensor],
-    type_threshold: float = 0.5,
-) -> Dict[str, float]:
-    """
-    Lightweight metrics for validation.
-
-    Returns:
-        type_micro_acc:
-            multi-label micro accuracy for degradation type prediction.
-        rank_acc:
-            pairwise severity ranking accuracy.
-        local_hit_rate:
-            top selected patch hit rate for local artifact masks.
-    """
-    device = outputs["type_logits"].device
-
-    type_labels = batch["type_labels"].to(device=device, dtype=torch.float32)
-    type_probs = torch.sigmoid(outputs["type_logits"])
-    type_pred = (type_probs >= type_threshold).float()
-
-    type_micro_acc = (type_pred == type_labels).float().mean().item()
-
-    rank_acc = compute_pairwise_rank_accuracy(
-        scores=outputs["severity_score"],
-        labels=batch["severity"].to(device=device, dtype=torch.float32),
-    )
-
-    local_hit_rate = compute_local_hit_rate(outputs, batch)
-
-    return {
-        "type_micro_acc": float(type_micro_acc),
-        "rank_acc": float(rank_acc),
-        "local_hit_rate": float(local_hit_rate),
-    }
-
-
-@torch.no_grad()
-def compute_pairwise_rank_accuracy(
-    scores: torch.Tensor,
-    labels: torch.Tensor,
-) -> float:
-    if scores.dim() != 2 or labels.dim() != 2:
-        return 0.0
-
-    labels_i = labels.unsqueeze(2)
-    labels_j = labels.unsqueeze(1)
-
-    scores_i = scores.unsqueeze(2)
-    scores_j = scores.unsqueeze(1)
-
-    pair_mask = labels_j > labels_i
-
-    if pair_mask.sum() == 0:
-        return 0.0
-
-    correct = (scores_j > scores_i)[pair_mask].float().mean()
-    return correct.item()
-
-
-@torch.no_grad()
-def compute_local_hit_rate(
-    outputs: Dict[str, torch.Tensor],
-    batch: Dict[str, torch.Tensor],
-    top_ratio: float = 0.1,
-) -> float:
-    """
-    For variants with local masks, compute whether top artifactness patches
-    overlap with synthetic local degradation regions.
-    """
-    device = outputs["local_artifact_logits"].device
-
-    logits = outputs["local_artifact_logits"]
-    masks = batch["local_masks"].to(device=device, dtype=torch.float32)
-    has_local = batch["has_local_mask"].to(device=device, dtype=torch.bool)
-
-    if has_local.sum() == 0:
-        return 0.0
-
-    logits = logits[has_local]  # [N, T, Gh, Gw]
-    masks = masks[has_local]    # [N, T, Gh, Gw]
-
-    n = logits.shape[0]
-    flat_logits = logits.reshape(n, -1)
-    flat_masks = masks.reshape(n, -1)
-
-    k = max(1, int(flat_logits.shape[1] * top_ratio))
-    top_idx = torch.topk(flat_logits, k=k, dim=1).indices
-
-    hit_values = torch.gather(flat_masks, dim=1, index=top_idx)
-
-    return hit_values.mean().item()
 
 
 class Qwen3VLVisionMLP(nn.Module):
@@ -2573,41 +2159,6 @@ class Qwen3VLForConditionalGeneration(Qwen3VLPreTrainedModel, GenerationMixin):
             )
         else:
             self.cls_head = None
-
-        if getattr(config, "use_fava", False):
-            self.fava = PropagationAwareFaVA(
-                image_size=config.fava_image_size,
-                patch_size=config.fava_patch_size,
-                num_frames=config.fava_num_frames,
-                num_bands=config.fava_num_bands,
-                token_dim=config.fava_token_dim,
-                num_artifact_tokens=config.fava_num_tokens,
-                num_query_blocks=config.fava_num_query_blocks,
-                num_heads=config.fava_num_heads,
-                top_k=config.fava_top_k,
-                peak_selection=config.fava_peak_selection,
-            )
-
-            hidden_size = config.text_config.hidden_size
-
-            if config.fava_projector_type == "linear":
-                self.fava_projector = nn.Linear(config.fava_token_dim, hidden_size)
-            elif config.fava_projector_type == "mlp":
-                self.fava_projector = nn.Sequential(
-                    nn.LayerNorm(config.fava_token_dim),
-                    nn.Linear(config.fava_token_dim, hidden_size),
-                    nn.GELU(),
-                    nn.Linear(hidden_size, hidden_size),
-                )
-            else:
-                raise ValueError(f"Unknown fava_projector_type: {config.fava_projector_type}")
-
-            if getattr(config, "freeze_fava", True):
-                for p in self.fava.parameters():
-                    p.requires_grad = False
-        else:
-            self.fava = None
-            self.fava_projector = None
 
         self.post_init()
 

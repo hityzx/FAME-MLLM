@@ -18,6 +18,13 @@ from transformers import (
 )
 
 
+UNUSED_FAVA_HEAD_PREFIXES = ("type_head.", "severity_head.", "fake_head.")
+
+
+def is_unused_fava_head(key: str) -> bool:
+    return key.startswith(UNUSED_FAVA_HEAD_PREFIXES)
+
+
 def strip_prefix_if_present(state_dict: Dict[str, torch.Tensor], prefix: str) -> Dict[str, torch.Tensor]:
     if all(k.startswith(prefix) for k in state_dict.keys()):
         return {k[len(prefix):]: v for k, v in state_dict.items()}
@@ -40,7 +47,53 @@ def load_fava_state_dict(fava_ckpt_path: str) -> Dict[str, torch.Tensor]:
     state_dict = strip_prefix_if_present(state_dict, "model.")
     state_dict = strip_prefix_if_present(state_dict, "fava.")
 
-    return state_dict
+    return {
+        key: value
+        for key, value in state_dict.items()
+        if not is_unused_fava_head(key)
+    }
+
+
+def load_fava_core(model, state_dict: Dict[str, torch.Tensor]) -> None:
+    target_state = {
+        key: value
+        for key, value in model.state_dict().items()
+        if not is_unused_fava_head(key)
+    }
+    missing = sorted(set(target_state) - set(state_dict))
+    unexpected = sorted(set(state_dict) - set(target_state))
+    shape_mismatches = sorted(
+        (
+            key,
+            tuple(state_dict[key].shape),
+            tuple(target_state[key].shape),
+        )
+        for key in set(state_dict) & set(target_state)
+        if state_dict[key].shape != target_state[key].shape
+    )
+    if missing or unexpected or shape_mismatches:
+        raise RuntimeError(
+            "FaVA core checkpoint mismatch: "
+            f"missing={missing}, unexpected={unexpected}, "
+            f"shape_mismatches={shape_mismatches}"
+        )
+
+    model.load_state_dict(state_dict, strict=False)
+
+
+def remove_unused_fava_modules(model) -> None:
+    for module in (getattr(model, "fava", None), getattr(model.model, "fava", None)):
+        if module is None:
+            continue
+        for name in ("type_head", "severity_head", "fake_head"):
+            if hasattr(module, name):
+                delattr(module, name)
+
+    # Older local Transformers code constructed a second, unused FaVA copy on
+    # the conditional-generation wrapper. The active copy lives in model.model.
+    for name in ("fava", "fava_projector"):
+        if hasattr(model, name):
+            delattr(model, name)
 
 
 def add_fava_token(tokenizer, fava_token: str) -> int:
@@ -256,12 +309,10 @@ def main() -> None:
     print("=" * 80)
     print("Loading FaVA checkpoint...")
     fava_state = load_fava_state_dict(args.fava_ckpt_path)
-
-    missing, unexpected = model.model.fava.load_state_dict(fava_state, strict=False)
+    load_fava_core(model.model.fava, fava_state)
 
     print(f"Loaded FaVA checkpoint from: {args.fava_ckpt_path}")
-    print(f"Missing keys in FaVA: {missing}")
-    print(f"Unexpected keys in FaVA: {unexpected}")
+    print(f"Loaded {len(fava_state)} FaVA core tensors")
 
     if freeze_fava:
         for p in model.model.fava.parameters():
@@ -296,6 +347,7 @@ def main() -> None:
     tokenizer.save_pretrained(output_dir)
     patch_processor_config(output_dir, args, fava_token_id)
 
+    remove_unused_fava_modules(model)
     model.save_pretrained(
         output_dir,
         safe_serialization=args.safe_serialization,

@@ -24,14 +24,10 @@ except AttributeError:
     BILINEAR = Image.BILINEAR
 
 
-# Preserve the original six-class output layout for checkpoint compatibility.
-# The two local-artifact classes remain negative in type-rank training.
 TYPE_NAMES = [
     "jpeg_compression",
     "resize_resample",
     "crop_resize",
-    "local_blur",
-    "local_recompression",
     "noise",
 ]
 
@@ -538,6 +534,3 @@ def build_fava_type_rank_dataloader(
     )
 
     return loader
-
-
-    print("transform_names:", batch["transform_names"])

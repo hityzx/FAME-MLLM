@@ -480,12 +480,7 @@ def load_checkpoint(
 ) -> Tuple[int, float]:
     ckpt = torch.load(ckpt_path, map_location=map_location)
 
-    missing, unexpected = model.load_state_dict(ckpt["model"], strict=False)
-
-    if len(missing) > 0:
-        print(f"[Warning] Missing keys when loading model: {missing}")
-    if len(unexpected) > 0:
-        print(f"[Warning] Unexpected keys when loading model: {unexpected}")
+    model.load_state_dict(ckpt["model"], strict=True)
 
     start_epoch = int(ckpt.get("epoch", 0)) + 1
     best_score = float(ckpt.get("best_score", -1e9))

@@ -12,7 +12,7 @@ import torch.nn.functional as F
 
 
 # Should be consistent with dataloader.py
-DEFAULT_NUM_DEGRADATION_TYPES = 6
+DEFAULT_NUM_DEGRADATION_TYPES = 4
 
 
 def build_dct_matrix(size: int) -> torch.Tensor:
