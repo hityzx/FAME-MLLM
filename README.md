@@ -65,7 +65,7 @@ python fame-mllm/merge_fava_into_qwen3vl.py \
     --cls_loss_weight 1.0 \
     --lm_loss_weight 1.0 \
     --use_consistency_loss \
-    --consistency_loss_weight 0.5 \
+    --consistency_loss_weight 0.05 \
     --consistency_temperature 1.0
 ```
 
@@ -88,3 +88,9 @@ bash fame-mllm/infer.sh
 ```
 
 The script merges the selected LoRA checkpoint, runs inference once, and writes the predictions and evaluation results to `SAVE_JSON`.
+
+### 6. JDM
+
+```bash
+python fame-mllm/jdm.py
+```
